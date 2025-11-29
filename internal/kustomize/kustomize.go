@@ -8,7 +8,6 @@ import (
 	"github.com/argoproj/argo-cd/v2/reposerver/apiclient"
 	"github.com/argoproj/argo-cd/v2/reposerver/repository"
 	"github.com/argoproj/argo-cd/v2/util/git"
-	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/akuity/kargo-render/internal/manifests"
@@ -25,7 +24,6 @@ func Render(
 	ctx context.Context,
 	path string,
 	images []string,
-	cfg Config,
 ) ([]byte, error) {
 	kustomizeImages := make(argoappv1.KustomizeImages, len(images))
 	for i, image := range images {
@@ -51,7 +49,6 @@ func Render(
 					Images: kustomizeImages,
 				},
 			},
-			KustomizeOptions: buildKustomizeOptions(cfg),
 		},
 		true,
 		&git.NoopCredsStore{}, // No need for this
@@ -62,7 +59,7 @@ func Render(
 	)
 	if err != nil {
 		return nil,
-			errors.Wrap(err, "error generating manifests using Argo CD repo server")
+			fmt.Errorf("error generating manifests using Argo CD repo server: %w", err)
 	}
 
 	// res.Manifests contains JSON manifests. We want YAML.
@@ -73,22 +70,4 @@ func Render(
 
 	// Glue the manifests together
 	return manifests.CombineYAML(yamlManifests), nil
-}
-
-func buildKustomizeOptions(cfg Config) *argoappv1.KustomizeOptions {
-	buildOptions := ""
-
-	if cfg.EnableHelm {
-		buildOptions += "--enable-helm "
-	}
-
-	if cfg.LoadRestrictor != "" {
-		buildOptions += fmt.Sprintf("--load-restrictor %s", cfg.LoadRestrictor)
-	} else {
-		buildOptions += "--load-restrictor LoadRestrictionsRootOnly"
-	}
-
-	return &argoappv1.KustomizeOptions{
-		BuildOptions: buildOptions,
-	}
 }

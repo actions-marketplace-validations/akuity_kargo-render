@@ -16,9 +16,7 @@ func TestNewService(t *testing.T) {
 	svc, ok := s.(*service)
 	require.True(t, ok)
 	require.NotNil(t, svc.logger)
-	require.NotNil(t, svc.helmRenderFn)
-	require.NotNil(t, svc.yttRenderFn)
-	require.NotNil(t, svc.kustomizeRenderFn)
+	require.NotNil(t, svc.renderFn)
 }
 
 func TestWriteAppManifests(t *testing.T) {
@@ -37,10 +35,8 @@ metadata:
 		},
 		[]byte("---\n"),
 	)
-	testDir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(testDir)
-	err = writeManifests(testDir, testYAMLBytes)
+	testDir := t.TempDir()
+	err := writeManifests(testDir, testYAMLBytes)
 	require.NoError(t, err)
 	filename := filepath.Join(testDir, "foobar-deployment.yaml")
 	exists, err := file.Exists(filename)

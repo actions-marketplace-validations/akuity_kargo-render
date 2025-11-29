@@ -7,24 +7,19 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/akuity/kargo-render/internal/helm"
-	"github.com/akuity/kargo-render/internal/kustomize"
-	"github.com/akuity/kargo-render/internal/ytt"
 )
 
 func TestLoadRepoConfig(t *testing.T) {
 	testCases := []struct {
 		name       string
 		setup      func() string
-		assertions func(error)
+		assertions func(*testing.T, error)
 	}{
 		{
 			name: "invalid JSON",
 			setup: func() string {
-				dir, err := os.MkdirTemp("", "")
-				require.NoError(t, err)
-				err = os.WriteFile(
+				dir := t.TempDir()
+				err := os.WriteFile(
 					filepath.Join(dir, "kargo-render.json"),
 					[]byte("bogus"),
 					0600,
@@ -32,7 +27,7 @@ func TestLoadRepoConfig(t *testing.T) {
 				require.NoError(t, err)
 				return dir
 			},
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.Error(t, err)
 				require.Contains(
 					t,
@@ -44,9 +39,8 @@ func TestLoadRepoConfig(t *testing.T) {
 		{
 			name: "invalid YAML",
 			setup: func() string {
-				dir, err := os.MkdirTemp("", "")
-				require.NoError(t, err)
-				err = os.WriteFile(
+				dir := t.TempDir()
+				err := os.WriteFile(
 					filepath.Join(dir, "kargo-render.yaml"),
 					[]byte("bogus"),
 					0600,
@@ -54,7 +48,7 @@ func TestLoadRepoConfig(t *testing.T) {
 				require.NoError(t, err)
 				return dir
 			},
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.Error(t, err)
 				require.Contains(
 					t,
@@ -66,9 +60,8 @@ func TestLoadRepoConfig(t *testing.T) {
 		{
 			name: "valid JSON",
 			setup: func() string {
-				dir, err := os.MkdirTemp("", "")
-				require.NoError(t, err)
-				err = os.WriteFile(
+				dir := t.TempDir()
+				err := os.WriteFile(
 					filepath.Join(dir, "kargo-render.json"),
 					[]byte(`{"configVersion": "v1alpha1"}`),
 					0600,
@@ -76,16 +69,15 @@ func TestLoadRepoConfig(t *testing.T) {
 				require.NoError(t, err)
 				return dir
 			},
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.NoError(t, err)
 			},
 		},
 		{
 			name: "valid YAML",
 			setup: func() string {
-				dir, err := os.MkdirTemp("", "")
-				require.NoError(t, err)
-				err = os.WriteFile(
+				dir := t.TempDir()
+				err := os.WriteFile(
 					filepath.Join(dir, "kargo-render.yaml"),
 					[]byte("configVersion: v1alpha1"),
 					0600,
@@ -93,7 +85,7 @@ func TestLoadRepoConfig(t *testing.T) {
 				require.NoError(t, err)
 				return dir
 			},
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.NoError(t, err)
 			},
 		},
@@ -101,7 +93,7 @@ func TestLoadRepoConfig(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			_, err := loadRepoConfig(testCase.setup())
-			testCase.assertions(err)
+			testCase.assertions(t, err)
 		})
 	}
 }
@@ -110,41 +102,107 @@ func TestNormalizeAndValidate(t *testing.T) {
 	testCases := []struct {
 		name       string
 		config     []byte
-		assertions func(error)
+		assertions func(*testing.T, error)
 	}{
 		{
 			name:   "invalid JSON",
 			config: []byte("{}"),
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.Error(t, err)
 			},
 		},
 		{
 			name:   "invalid YAML",
 			config: []byte(""),
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.Error(t, err)
 			},
 		},
 		{
 			name:   "valid JSON",
 			config: []byte(`{"configVersion": "v1alpha1"}`),
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.NoError(t, err)
 			},
 		},
 		{
 			name:   "valid YAML",
 			config: []byte("configVersion: v1alpha1"),
-			assertions: func(err error) {
+			assertions: func(t *testing.T, err error) {
 				require.NoError(t, err)
 			},
+		},
+		{
+			name: "valid kustomize",
+			assertions: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			config: []byte(`configVersion: v1alpha1
+branchConfigs:
+  - name: env/prod
+    appConfigs:
+      my-proj:
+        configManagement:
+          path: env/prod/my-proj
+          kustomize:
+            buildOptions: "--load-restrictor LoadRestrictionsNone"
+        outputPath: prod/my-proj
+        combineManifests: true`),
+		},
+		{
+			name: "valid helm",
+			assertions: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			config: []byte(`configVersion: v1alpha1
+branchConfigs:
+  - name: env/prod
+    appConfigs:
+      my-proj:
+        configManagement:
+          path: env/prod/my-proj
+          helm:
+            namespace: my-namespace
+        outputPath: prod/my-proj
+        combineManifests: true`),
+		},
+		{
+			name: "valid no config management tool",
+			assertions: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			config: []byte(`configVersion: v1alpha1
+branchConfigs:
+  - name: env/prod
+    appConfigs:
+      my-proj:
+        configManagement:
+          path: env/prod/my-proj
+        outputPath: prod/my-proj
+        combineManifests: true`),
+		},
+		{
+			name: "invalid property",
+			assertions: func(t *testing.T, err error) {
+				require.Error(t, err)
+			},
+			config: []byte(`configVersion: v1alpha1
+branchConfigs:
+  - name: env/prod
+    appConfigs:
+      my-proj:
+        configManagement:
+          path: env/prod/my-proj
+          unknown:
+            hello: world
+        outputPath: prod/my-proj
+        combineManifests: true`),
 		},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			configBytes, err := normalizeAndValidate(testCase.config)
-			testCase.assertions(err)
+			testCase.assertions(t, err)
 			// For any validation that doesn't fail, the bytes returned should be
 			// JSON we can unmarshal...
 			if err == nil {
@@ -154,95 +212,4 @@ func TestNormalizeAndValidate(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestExpandBranchConfig(t *testing.T) {
-	const val = "foo"
-	testCfg := branchConfig{
-		AppConfigs: map[string]appConfig{
-			"my-kustomize-app": {
-				ConfigManagement: configManagementConfig{
-					Kustomize: &kustomize.Config{
-						Path: "${0}",
-					},
-				},
-				OutputPath: "${0}",
-			},
-			"my-helm-app": {
-				ConfigManagement: configManagementConfig{
-					Helm: &helm.Config{
-						ChartPath:   "${0}",
-						ValuesPaths: []string{"${0}", "${0}"},
-					},
-				},
-				OutputPath: "${0}",
-			},
-			"my-ytt-app": {
-				ConfigManagement: configManagementConfig{
-					Ytt: &ytt.Config{
-						Paths: []string{"${0}", "${0}"},
-					},
-				},
-				OutputPath: "${0}",
-			},
-		},
-	}
-	cfg := testCfg.expand([]string{val})
-	require.Equal(
-		t,
-		val,
-		cfg.AppConfigs["my-kustomize-app"].ConfigManagement.Kustomize.Path,
-	)
-	require.Equal(
-		t,
-		val,
-		cfg.AppConfigs["my-kustomize-app"].OutputPath,
-	)
-	require.Equal(
-		t,
-		val,
-		cfg.AppConfigs["my-helm-app"].ConfigManagement.Helm.ChartPath,
-	)
-	require.Equal(
-		t,
-		[]string{val, val},
-		cfg.AppConfigs["my-helm-app"].ConfigManagement.Helm.ValuesPaths,
-	)
-	require.Equal(
-		t,
-		val,
-		cfg.AppConfigs["my-helm-app"].OutputPath,
-	)
-	require.Equal(
-		t,
-		[]string{val, val},
-		cfg.AppConfigs["my-ytt-app"].ConfigManagement.Ytt.Paths,
-	)
-	require.Equal(
-		t,
-		val,
-		cfg.AppConfigs["my-ytt-app"].OutputPath,
-	)
-	// Check that the original testCfg.AppConfigs haven't been touched.
-	// References to maps are pointers, hence the extra care.
-	require.Equal(
-		t,
-		"${0}",
-		testCfg.AppConfigs["my-kustomize-app"].ConfigManagement.Kustomize.Path,
-	)
-	require.Equal(
-		t,
-		"${0}",
-		testCfg.AppConfigs["my-helm-app"].ConfigManagement.Helm.ChartPath,
-	)
-	require.Equal(
-		t,
-		[]string{"${0}", "${0}"},
-		testCfg.AppConfigs["my-helm-app"].ConfigManagement.Helm.ValuesPaths,
-	)
-	require.Equal(
-		t,
-		[]string{"${0}", "${0}"},
-		testCfg.AppConfigs["my-ytt-app"].ConfigManagement.Ytt.Paths,
-	)
 }

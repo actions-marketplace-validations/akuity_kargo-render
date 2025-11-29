@@ -2,18 +2,16 @@ package render
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/pkg/errors"
-	uuid "github.com/satori/go.uuid"
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/akuity/kargo-render/internal/helm"
-	"github.com/akuity/kargo-render/internal/kustomize"
+	"github.com/akuity/kargo-render/internal/argocd"
 	"github.com/akuity/kargo-render/internal/manifests"
-	"github.com/akuity/kargo-render/internal/ytt"
 	"github.com/akuity/kargo-render/pkg/git"
 )
 
@@ -25,28 +23,15 @@ type ServiceOptions struct {
 // Implementations of this interface are transport-agnostic.
 type Service interface {
 	// RenderManifests handles a rendering request.
-	RenderManifests(context.Context, Request) (Response, error)
+	RenderManifests(context.Context, *Request) (Response, error)
 }
 
 type service struct {
-	logger *log.Logger
-
-	// These behaviors are overridable for testing purposes
-	helmRenderFn func(
+	logger   *log.Logger
+	renderFn func(
 		ctx context.Context,
-		releaseName string,
-		namespace string,
-		chartPath string,
-		valuesPaths []string,
-	) ([]byte, error)
-
-	yttRenderFn func(ctx context.Context, paths []string) ([]byte, error)
-
-	kustomizeRenderFn func(
-		ctx context.Context,
-		path string,
-		images []string,
-		cfg kustomize.Config,
+		repoRoot string,
+		cfg argocd.ConfigManagementConfig,
 	) ([]byte, error)
 }
 
@@ -62,19 +47,17 @@ func NewService(opts *ServiceOptions) Service {
 	logger := log.New()
 	logger.SetLevel(log.Level(opts.LogLevel))
 	return &service{
-		logger:            logger,
-		helmRenderFn:      helm.Render,
-		yttRenderFn:       ytt.Render,
-		kustomizeRenderFn: kustomize.Render,
+		logger:   logger,
+		renderFn: argocd.Render,
 	}
 }
 
 // nolint: gocyclo
 func (s *service) RenderManifests(
 	ctx context.Context,
-	req Request,
+	req *Request,
 ) (Response, error) {
-	req.id = uuid.NewV4().String()
+	req.id = uuid.NewString()
 
 	logger := s.logger.WithField("request", req.id)
 	startEndLogger := logger.WithFields(log.Fields{
@@ -87,7 +70,7 @@ func (s *service) RenderManifests(
 	res := Response{}
 
 	var err error
-	if req, err = validateAndCanonicalizeRequest(req); err != nil {
+	if err = req.canonicalizeAndValidate(); err != nil {
 		return res, err
 	}
 	startEndLogger.Debug("validated rendering request")
@@ -97,45 +80,88 @@ func (s *service) RenderManifests(
 		request: req,
 	}
 
-	if rc.repo, err = git.Clone(
-		rc.request.RepoURL,
-		git.RepoCredentials{
-			SSHPrivateKey: rc.request.RepoCreds.SSHPrivateKey,
-			Username:      rc.request.RepoCreds.Username,
-			Password:      rc.request.RepoCreds.Password,
-		},
-	); err != nil {
-		return res, errors.Wrap(err, "error cloning remote repository")
+	if rc.request.LocalInPath != "" {
+
+		// We'll be taking our input from a local directory which is presumably
+		// a git repository with the desired source commit already checked out.
+		//
+		// This is mainly useful when Kargo proper wishes to handle the reading and
+		// writing to/from remote repositories itself, leaving Kargo Render to
+		// handle rendering only.
+
+		if rc.repo, err = git.CopyRepo(
+			rc.request.LocalInPath,
+			git.RepoCredentials(rc.request.RepoCreds),
+		); err != nil {
+			return res, fmt.Errorf("error copying local repository: %w", err)
+		}
+		// Check if the working tree is dirty
+		var isDirty bool
+		if isDirty, err = rc.repo.HasDiffs(); err != nil {
+			return res, fmt.Errorf("error checking for diffs: %w", err)
+		}
+		if isDirty {
+			return res, errors.New("working tree is dirty; refusing to proceed")
+		}
+		// Check that there is exactly one remote and it's named "origin"
+		var remotes []string
+		if remotes, err = rc.repo.Remotes(); err != nil {
+			return res, fmt.Errorf("error getting remotes: %w", err)
+		}
+		if len(remotes) != 1 || remotes[0] != git.RemoteOrigin {
+			return res, errors.New(
+				"local repository must have exactly one remote, which must be " +
+					"named \"origin\"; refusing to proceed",
+			)
+		}
+
+	} else {
+
+		// Clone the remote repository ourselves
+
+		if rc.repo, err = git.Clone(
+			rc.request.RepoURL,
+			git.RepoCredentials{
+				SSHPrivateKey: rc.request.RepoCreds.SSHPrivateKey,
+				Username:      rc.request.RepoCreds.Username,
+				Password:      rc.request.RepoCreds.Password,
+			},
+		); err != nil {
+			return res, fmt.Errorf("error cloning remote repository: %w", err)
+		}
+
 	}
 	defer rc.repo.Close()
 
 	// TODO: Add some logging to this block
-	if rc.request.Ref == "" {
+	if rc.request.LocalInPath != "" || rc.request.Ref == "" {
+		// For either of these mutually exclusive cases, we don't know the source
+		// commit yet
 		if rc.source.commit, err = rc.repo.LastCommitID(); err != nil {
-			return res, errors.Wrap(err, "error getting last commit ID")
+			return res, fmt.Errorf("error getting last commit ID: %w", err)
 		}
 	} else {
 		if err = rc.repo.Checkout(rc.request.Ref); err != nil {
-			return res, errors.Wrapf(err, "error checking out %q", rc.request.Ref)
+			return res, fmt.Errorf("error checking out %q: %w", rc.request.Ref, err)
 		}
 		if rc.intermediate.branchMetadata, err =
 			loadBranchMetadata(rc.repo.WorkingDir()); err != nil {
-			return res, errors.Wrap(err, "error loading branch metadata")
+			return res, fmt.Errorf("error loading branch metadata: %w", err)
 		}
 		if rc.intermediate.branchMetadata == nil {
 			// We're not on a target branch. We're sitting on the source commit.
 			if rc.source.commit, err = rc.repo.LastCommitID(); err != nil {
-				return res, errors.Wrap(err, "error getting last commit ID")
+				return res, fmt.Errorf("error getting last commit ID: %w", err)
 			}
 		} else {
 			// Follow the branch metadata back to the real source commit
 			if err = rc.repo.Checkout(
 				rc.intermediate.branchMetadata.SourceCommit,
 			); err != nil {
-				return res, errors.Wrapf(
-					err,
-					"error checking out %q",
+				return res, fmt.Errorf(
+					"error checking out %q: %w",
 					rc.intermediate.branchMetadata.SourceCommit,
+					err,
 				)
 			}
 			rc.source.commit = rc.intermediate.branchMetadata.SourceCommit
@@ -145,24 +171,22 @@ func (s *service) RenderManifests(
 	repoConfig, err := loadRepoConfig(rc.repo.WorkingDir())
 	if err != nil {
 		return res,
-			errors.Wrap(err, "error loading Kargo Render configuration from repo")
+			fmt.Errorf("error loading Kargo Render configuration from repo: %w", err)
 	}
 	if rc.target.branchConfig, err =
 		repoConfig.GetBranchConfig(rc.request.TargetBranch); err != nil {
-		return res, errors.Wrapf(
-			err,
-			"error loading configuration for branch %q",
+		return res, fmt.Errorf(
+			"error loading configuration for branch %q: %w",
 			rc.request.TargetBranch,
+			err,
 		)
 	}
 
 	if len(rc.target.branchConfig.AppConfigs) == 0 {
 		rc.target.branchConfig.AppConfigs = map[string]appConfig{
 			"app": {
-				ConfigManagement: configManagementConfig{
-					Kustomize: &kustomize.Config{
-						Path: rc.request.TargetBranch,
-					},
+				ConfigManagement: argocd.ConfigManagementConfig{
+					Path: rc.request.TargetBranch,
 				},
 			},
 		}
@@ -170,28 +194,39 @@ func (s *service) RenderManifests(
 
 	if rc.target.prerenderedManifests, err =
 		s.preRender(ctx, rc, rc.repo.WorkingDir()); err != nil {
-		return res, errors.Wrap(err, "error pre-rendering manifests")
+		return res, fmt.Errorf("error pre-rendering manifests: %w", err)
 	}
 
 	if err = switchToTargetBranch(rc); err != nil {
-		return res, errors.Wrap(err, "error switching to target branch")
+		return res, fmt.Errorf("error switching to target branch: %w", err)
 	}
 
 	oldTargetBranchMetadata, err := loadBranchMetadata(rc.repo.WorkingDir())
 	if err != nil {
-		return res, errors.Wrap(err, "error loading branch metadata")
+		return res, fmt.Errorf("error loading branch metadata: %w", err)
 	}
 	if oldTargetBranchMetadata == nil {
-		return res, errors.Errorf(
-			"target branch %q already exists, but does not appear to be managed by "+
-				"Kargo Render; refusing to overwrite branch contents",
-			rc.request.TargetBranch,
-		)
+		// The target branch doesn't appear to already be managed by Kargo Render.
+		// We'll let this slide if the branch is 100% empty, but we'll refuse to
+		// proceed otherwise.
+		var fileInfos []os.DirEntry
+		if fileInfos, err = os.ReadDir(rc.repo.WorkingDir()); err != nil {
+			return res, fmt.Errorf("error reading directory contents: %w", err)
+		}
+		if len(fileInfos) != 1 && fileInfos[0].Name() != ".git" {
+			return res, fmt.Errorf(
+				"target branch %q already exists, but does not appear to be managed by "+
+					"Kargo Render; refusing to overwrite branch contents",
+				rc.request.TargetBranch,
+			)
+		}
+		rc.target.oldBranchMetadata = branchMetadata{}
+	} else {
+		rc.target.oldBranchMetadata = *oldTargetBranchMetadata
 	}
-	rc.target.oldBranchMetadata = *oldTargetBranchMetadata
 
 	if rc.target.commit.branch, err = switchToCommitBranch(rc); err != nil {
-		return res, errors.Wrap(err, "error switching to commit branch")
+		return res, fmt.Errorf("error switching to commit branch: %w", err)
 	}
 
 	if rc.target.commit.branch != rc.request.TargetBranch {
@@ -200,7 +235,7 @@ func (s *service) RenderManifests(
 		// branch already existed.
 		if rc.target.commit.oldBranchMetadata, err =
 			loadBranchMetadata(rc.repo.WorkingDir()); err != nil {
-			return res, errors.Wrap(err, "error loading branch metadata")
+			return res, fmt.Errorf("error loading branch metadata: %w", err)
 		}
 	}
 
@@ -209,31 +244,69 @@ func (s *service) RenderManifests(
 		rc.target.renderedManifests,
 		err =
 		renderLastMile(ctx, rc); err != nil {
-		return res, errors.Wrap(err, "error in last-mile manifest rendering")
+		return res, fmt.Errorf("error in last-mile manifest rendering: %w", err)
+	}
+
+	// If we're writing to stdout, we're done
+	if rc.request.Stdout {
+		res.ActionTaken = ActionTakenNone
+		res.Manifests = rc.target.renderedManifests
+		return res, nil
+	}
+
+	// Figure out where we're writing to
+	outputDir := rc.repo.WorkingDir()
+	if rc.request.LocalOutPath != "" {
+		outputDir = rc.request.LocalOutPath
+		if err = copyBranchContents(rc.repo.WorkingDir(), outputDir); err != nil {
+			return res, fmt.Errorf(
+				"error copying branch contents to local output directory %q: %w",
+				outputDir,
+				err,
+			)
+		}
+		defer func() {
+			if err != nil {
+				if rmErr := os.RemoveAll(outputDir); rmErr != nil {
+					logger.WithError(err).Error(
+						"error cleaning up local output directory",
+					)
+				}
+			}
+		}()
 	}
 
 	// Write branch metadata
 	if err = writeBranchMetadata(
 		rc.target.newBranchMetadata,
-		rc.repo.WorkingDir(),
+		outputDir,
 	); err != nil {
-		return res, errors.Wrap(err, "error writing branch metadata")
+		return res, fmt.Errorf("error writing branch metadata: %w", err)
 	}
 	logger.WithField("sourceCommit", rc.source.commit).
 		Debug("wrote branch metadata")
 
-	// Write the new fully-rendered manifests to the root of the repo
-	if err = writeAllManifests(rc); err != nil {
+	// Write the fully-rendered manifests to the root of the repo
+	if err = writeAllManifests(rc, outputDir); err != nil {
 		return res, err
 	}
 	logger.Debug("wrote all manifests")
+
+	// If we're writing to a local directory, we're done
+	if rc.request.LocalOutPath != "" {
+		res.ActionTaken = ActionTakenWroteToLocalPath
+		res.LocalPath = outputDir
+		return res, nil
+	}
+
+	// If we get to here, we're writing to the remote repository
 
 	// Before committing, check if we actually have any diffs from the head of
 	// this branch that are NOT just Kargo Render metadata. We'd have an error if
 	// we tried to commit with no diffs!
 	diffPaths, err := rc.repo.GetDiffPaths()
 	if err != nil {
-		return res, errors.Wrap(err, "error checking for diffs")
+		return res, fmt.Errorf("error checking for diffs: %w", err)
 	}
 	if len(diffPaths) == 0 ||
 		(len(diffPaths) == 1 && diffPaths[0] == ".kargo-render/metadata.yaml") {
@@ -242,11 +315,13 @@ func (s *service) RenderManifests(
 				"commit branch; no further action is required",
 		)
 		res.ActionTaken = ActionTakenNone
-		res.CommitID, err = rc.repo.LastCommitID()
-		return res, errors.Wrap(
-			err,
-			"error getting last commit ID from the commit branch",
-		)
+		if res.CommitID, err = rc.repo.LastCommitID(); err != nil {
+			return res, fmt.Errorf(
+				"error getting last commit ID from the commit branch: %w",
+				err,
+			)
+		}
+		return res, nil
 	}
 
 	if rc.target.commit.message, err = buildCommitMessage(rc); err != nil {
@@ -256,12 +331,12 @@ func (s *service) RenderManifests(
 
 	// Commit the changes
 	if err = rc.repo.AddAllAndCommit(rc.target.commit.message); err != nil {
-		return res, errors.Wrapf(err, "error committing manifests")
+		return res, fmt.Errorf("error committing manifests: %w", err)
 	}
 	if rc.target.commit.id, err = rc.repo.LastCommitID(); err != nil {
-		return res, errors.Wrap(
+		return res, fmt.Errorf(
+			"error getting last commit ID from the commit branch: %w",
 			err,
-			"error getting last commit ID from the commit branch",
 		)
 	}
 	logger.WithFields(log.Fields{
@@ -271,9 +346,9 @@ func (s *service) RenderManifests(
 
 	// Push the commit branch to the remote
 	if err = rc.repo.Push(); err != nil {
-		return res, errors.Wrap(
+		return res, fmt.Errorf(
+			"error pushing commit branch to remote: %w",
 			err,
-			"error pushing commit branch to remote",
 		)
 	}
 	logger.WithField("commitBranch", rc.target.commit.branch).
@@ -283,7 +358,7 @@ func (s *service) RenderManifests(
 	if rc.target.branchConfig.PRs.Enabled {
 		if res.PullRequestURL, err = openPR(ctx, rc); err != nil {
 			return res,
-				errors.Wrap(err, "error opening pull request to the target branch")
+				fmt.Errorf("error opening pull request to the target branch: %w", err)
 		}
 		if res.PullRequestURL == "" {
 			res.ActionTaken = ActionTakenUpdatedPR
@@ -315,10 +390,10 @@ func buildCommitMessage(rc requestContext) (string, error) {
 		// Use the source commit's message as a starting point
 		var err error
 		if commitMsg, err = rc.repo.CommitMessage(rc.source.commit); err != nil {
-			return "", errors.Wrapf(
-				err,
-				"error getting commit message for commit %q",
+			return "", fmt.Errorf(
+				"error getting commit message for commit %q: %w",
 				rc.source.commit,
+				err,
 			)
 		}
 	}
@@ -381,30 +456,31 @@ func buildCommitMessage(rc requestContext) (string, error) {
 	return formattedCommitMsg, nil
 }
 
-func writeAllManifests(rc requestContext) error {
+func writeAllManifests(rc requestContext, outputDir string) error {
 	for appName, appConfig := range rc.target.branchConfig.AppConfigs {
 		appLogger := rc.logger.WithField("app", appName)
-		var outputDir string
+		var appOutputDir string
 		if appConfig.OutputPath != "" {
-			outputDir = filepath.Join(rc.repo.WorkingDir(), appConfig.OutputPath)
+			appOutputDir = filepath.Join(outputDir, appConfig.OutputPath)
 		} else {
-			outputDir = filepath.Join(rc.repo.WorkingDir(), appName)
+			appOutputDir = filepath.Join(outputDir, appName)
 		}
 		var err error
 		if appConfig.CombineManifests {
 			appLogger.Debug("manifests will be combined into a single file")
 			err =
-				writeCombinedManifests(outputDir, rc.target.renderedManifests[appName])
+				writeCombinedManifests(appOutputDir, rc.target.renderedManifests[appName])
 		} else {
 			appLogger.Debug("manifests will NOT be combined into a single file")
-			err = writeManifests(outputDir, rc.target.renderedManifests[appName])
+			err = writeManifests(appOutputDir, rc.target.renderedManifests[appName])
 		}
 		appLogger.Debug("wrote manifests")
 		if err != nil {
-			return errors.Wrapf(
-				err, "error writing manifests for app %q to %q",
+			return fmt.Errorf(
+				"error writing manifests for app %q to %q: %w",
 				appName,
-				outputDir,
+				appOutputDir,
+				err,
 			)
 		}
 	}
@@ -413,7 +489,7 @@ func writeAllManifests(rc requestContext) error {
 
 func writeManifests(dir string, yamlBytes []byte) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return errors.Wrapf(err, "error creating directory %q", dir)
+		return fmt.Errorf("error creating directory %q: %w", dir, err)
 	}
 	manifestsByResourceTypeAndName, err := manifests.SplitYAML(yamlBytes)
 	if err != nil {
@@ -426,25 +502,27 @@ func writeManifests(dir string, yamlBytes []byte) error {
 		)
 		// nolint: gosec
 		if err := os.WriteFile(fileName, manifest, 0644); err != nil {
-			return errors.Wrapf(
-				err,
-				"error writing manifest to %q",
+			return fmt.Errorf(
+				"error writing manifest to %q: %w",
 				fileName,
+				err,
 			)
 		}
 	}
 	return nil
 }
 
-func writeCombinedManifests(dir string, manifests []byte) error {
+func writeCombinedManifests(dir string, manifestBytes []byte) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return errors.Wrapf(err, "error creating directory %q", dir)
+		return fmt.Errorf("error creating directory %q: %w", dir, err)
 	}
 	fileName := filepath.Join(dir, "all.yaml")
-	return errors.Wrapf(
-		// nolint: gosec
-		os.WriteFile(fileName, manifests, 0644),
-		"error writing manifests to %q",
-		fileName,
-	)
+	if err := os.WriteFile(fileName, manifestBytes, 0644); err != nil { // nolint: gosec
+		return fmt.Errorf(
+			"error writing manifests to %q: %w",
+			fileName,
+			err,
+		)
+	}
+	return nil
 }

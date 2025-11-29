@@ -11,19 +11,23 @@ GitHub Actions, Kargo Render can be run as an action.
 :::info
 The Kargo Render action utilizes the official Kargo Render Docker image and
 therefore has guaranteed access to compatible versions of
-Git, Helm, Kustomize, and ytt, which are included on that image.
+Git, Helm, and Kustomize, which are included on that image.
 :::
 
 Example usage:
 
 ```yaml
+permissions: 
+  contents: write
+  pull-requests: write
+
 jobs:
   render-test-manifests:
     name: Render test manifests
     runs-on: ubuntu-latest
     steps:
     - name: Render manifests
-      uses: akuity/akuity-kargo-render@v0.1.0-rc.25
+      uses: akuity/kargo-render-action@v0.1.0-rc.34
       with:
         personalAccessToken: ${{ secrets.GITHUB_TOKEN }}
         targetBranch: env/test
@@ -36,8 +40,8 @@ rest.
 
 :::note
 `secrets.GITHUB_TOKEN` is automatically available in every GitHub Actions
-workflow and, depending on repository settings, may have sufficient permissions
-to both read from and write to your repository. If this is not the case, you can
-update repository settings. You can read more about this
-[here](https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token).
+workflow and, depending on your workflow and repository settings, may have
+sufficient permissions to both read from and write to your repository. If
+this is not the case, you can update repository settings. You can read more
+about this [here](https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token).
 :::

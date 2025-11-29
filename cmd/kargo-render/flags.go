@@ -1,16 +1,12 @@
-package cli
-
-import (
-	"flag"
-
-	"github.com/spf13/pflag"
-)
+package main
 
 const (
 	flagAllowEmpty    = "allow-empty"
 	flagCommitMessage = "commit-message"
 	flagDebug         = "debug"
 	flagImage         = "image"
+	flagLocalInPath   = "local-in-path"
+	flagLocalOutPath  = "local-out-path"
 	flagOutput        = "output"
 	flagOutputJSON    = "json"
 	flagOutputYAML    = "yaml"
@@ -18,20 +14,6 @@ const (
 	flagRepo          = "repo"
 	flagRepoPassword  = "repo-password"
 	flagRepoUsername  = "repo-username"
+	flagStdout        = "stdout"
 	flagTargetBranch  = "target-branch"
 )
-
-var flagSetOutput *pflag.FlagSet
-
-func init() {
-	flagSetOutput = pflag.NewFlagSet(
-		"output",
-		pflag.ErrorHandling(flag.ExitOnError),
-	)
-	flagSetOutput.StringP(
-		flagOutput,
-		"o",
-		"",
-		"specify a format for command output (json or yaml)",
-	)
-}
