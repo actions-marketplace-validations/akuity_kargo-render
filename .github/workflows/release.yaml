@@ -41,7 +41,7 @@ jobs:
       uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
     - name: Docker meta
       id: meta
-      uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1      with:
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.5.1      with:
       with:
         images: ghcr.io/akuity/kargo-render
         flavor: latest=false
